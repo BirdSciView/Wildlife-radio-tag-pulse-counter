@@ -114,7 +114,7 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None, snr_hi
               f"freq={freq_hz/1e6:.3f} MHz, SNR={snr_db:.2f} dB, PAR={par:.2f}, NoiseFloor={noise_floor:.3f}, "
               f"AvgSNR={avg_snr:.2f} dB")
 
-    # Log suspected missed peaks
+    # Log suspected missed peaks (only if PAR > 3)
     for p in missed_candidates:
         now = datetime.datetime.now()
         date_str = now.date().isoformat()
@@ -126,6 +126,9 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None, snr_hi
 
         snr_db = 20 * math.log10(amp / noise_floor) if noise_floor > 0 else 0
         par = amp / avg_env if avg_env > 0 else 0
+
+        if par <= 3.0:
+            continue  # skip weak suspected peaks
 
         writer.writerow([
             date_str, time_str,
@@ -144,7 +147,10 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None, snr_hi
         if len(merged_peaks) > 0:
             ax_env.scatter(merged_peaks, env[merged_peaks], color='green', label="Confirmed pulses")
         if len(missed_candidates) > 0:
-            ax_env.scatter(missed_candidates, env[missed_candidates], color='purple', marker='x', label="Suspected missed")
+            # Only plot suspected peaks with PAR > 3
+            strong_suspects = [p for p in missed_candidates if (env[p]/avg_env if avg_env>0 else 0) > 3]
+            if strong_suspects:
+                ax_env.scatter(strong_suspects, env[strong_suspects], color='purple', marker='x', label="Suspected missed")
         ax_env.set_title(f"Envelope at {freq_hz/1e6:.3f} MHz")
         ax_env.set_xlabel("Sample index")
         ax_env.set_ylabel("Amplitude")
