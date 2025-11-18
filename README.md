@@ -1,1 +1,3 @@
-This is a small python script that detects pulses from a wildlife radio transmitter tag, Timestamps each and saves basic information about each pulse to a csv file.  There is some limited quality control to avoid missing pulses or double counting pulses that get split by the envelope.
+This is a small python script that detects pulses from a wildlife radio transmitter tag, Timestamps each and saves basic information about each pulse to a csv file.  There is some limited quality control to avoid missing pulses or double counting pulses that get split by the envelope.  Confirmed and suspected peaks are flagged in the csv file.  Basic information (time, frequencies, csv name, sample rate, etc...) are logged in a seperate log file.  A new csv file is made each day.
+This works with a Raspberry Pi 5 and a cheap RTLSDR
+Multiple frequencies can be monitored sequentially and set in the command line.
