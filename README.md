@@ -1,0 +1,1 @@
+This is a small python script that detects pulses from a wildlife radio transmitter tag, Timestamps each and saves basic information about each pulse to a csv file.  There is some limited quality control to avoid missing pulses or double counting pulses that get split by the envelope.
