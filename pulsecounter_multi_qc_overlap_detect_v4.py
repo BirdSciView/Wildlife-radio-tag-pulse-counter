@@ -59,7 +59,9 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
     samples = sdr.read_samples(BLOCK_SIZE)
 
     # Software overlap: prepend tail from previous buffer
+    offset_samples = 0
     if prev_tail is not None:
+        offset_samples = len(prev_tail)
         samples = np.concatenate([prev_tail, samples])
 
     # Save new tail for next call
@@ -109,8 +111,8 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
         snr_db = 20 * math.log10(amp / noise_floor) if noise_floor > 0 else 0
         par = amp / avg_env if avg_env > 0 else 0
 
-        # Absolute peak time in ms
-        peak_time_ms = (p / SAMPLE_RATE) * 1000.0
+        # Correct absolute peak time: account for overlap offset
+        peak_time_ms = ((p - offset_samples) / SAMPLE_RATE) * 1000.0
         if last_peak_time is not None and abs(peak_time_ms - last_peak_time) < merge_window_ms:
             continue  # skip double count
 
@@ -131,11 +133,11 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
 
         last_peak_time = peak_time_ms
 
-    # Log suspected missed peaks (only if PAR > 4)
+    # Log suspected missed peaks (only if PAR > 3)
     for p in missed_candidates:
         amp = env[p]
         par = amp / avg_env if avg_env > 0 else 0
-        if par <= 4.0:
+        if par <= 3.0:
             continue
 
         now = datetime.datetime.now()
