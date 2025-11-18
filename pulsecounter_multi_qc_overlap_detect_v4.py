@@ -50,12 +50,21 @@ def build_csv_filename(freqs_hz, date=None):
     return f"pulse_log_{date_str}_{freqs_str}.csv"
 
 def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
-                      snr_history=None, last_peak_time=None, merge_window_ms=10):
+                      snr_history=None, last_peak_time=None, prev_tail=None,
+                      merge_window_ms=10, overlap_fraction=0.05):
     sdr.center_freq = freq_hz
     b_bp, a_bp = design_bandpass(SAMPLE_RATE, 2000, 25000)
 
-    # Read with overlap (10% extra samples)
-    samples = sdr.read_samples(int(BLOCK_SIZE * 1.1))
+    # Read exactly BLOCK_SIZE samples
+    samples = sdr.read_samples(BLOCK_SIZE)
+
+    # Software overlap: prepend tail from previous buffer
+    if prev_tail is not None:
+        samples = np.concatenate([prev_tail, samples])
+
+    # Save new tail for next call
+    new_tail = samples[-int(overlap_fraction * BLOCK_SIZE):]
+
     bp = bandpass_filter(samples, b_bp, a_bp)
     bp = bp - np.mean(bp)
     env = np.abs(bp)
@@ -122,11 +131,11 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
 
         last_peak_time = peak_time_ms
 
-    # Log suspected missed peaks (only if PAR > 3)
+    # Log suspected missed peaks (only if PAR > 4)
     for p in missed_candidates:
         amp = env[p]
         par = amp / avg_env if avg_env > 0 else 0
-        if par <= 3.0:
+        if par <= 4.0:
             continue
 
         now = datetime.datetime.now()
@@ -162,7 +171,7 @@ def process_frequency(sdr, freq_hz, writer, live_plot=False, ax_env=None,
         ax_env.legend()
         plt.pause(0.01)
 
-    return last_peak_time
+    return last_peak_time, new_tail
 def main(freqs_hz, interval, live_plot=False):
     logging.info("=== Multi-Frequency Pulse Logger Started ===")
     logging.info(f"Frequencies: {', '.join([f'{f/1e6:.3f} MHz' for f in freqs_hz])}")
@@ -194,6 +203,7 @@ def main(freqs_hz, interval, live_plot=False):
 
     try:
         last_peak_time = None
+        prev_tail = None
         while True:
             # Rotate file if date changed
             today = datetime.datetime.now().date()
@@ -210,9 +220,10 @@ def main(freqs_hz, interval, live_plot=False):
                 logging.info(f"Rotated to new CSV file: {csv_file}")
 
             for freq_hz in freqs_hz:
-                last_peak_time = process_frequency(
+                last_peak_time, prev_tail = process_frequency(
                     sdr, freq_hz, writer, live_plot, ax_env, snr_history,
-                    last_peak_time=last_peak_time, merge_window_ms=10
+                    last_peak_time=last_peak_time, prev_tail=prev_tail,
+                    merge_window_ms=10, overlap_fraction=0.05
                 )
                 time.sleep(interval)
     except KeyboardInterrupt:
@@ -227,7 +238,7 @@ def main(freqs_hz, interval, live_plot=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Multi-frequency wildlife tag pulse logger with missed peak flag, PAR filter, overlap, and daily rotation"
+        description="Multi-frequency wildlife tag pulse logger with missed peak flag, PAR filter, software overlap, and daily rotation"
     )
     parser.add_argument("--plot", action="store_true", help="Enable live plotting of envelope")
     parser.add_argument("--freqs", type=float, nargs="+", default=DEFAULT_FREQS_MHZ,
