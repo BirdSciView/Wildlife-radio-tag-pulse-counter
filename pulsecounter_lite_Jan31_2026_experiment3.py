@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PulseCounter SDR Logger — Decimation + Overload Detection (Configurable Decimation)
------------------------------------------------------------------------------------
-This script scans one or more RF frequencies using an RTL‑SDR receiver and detects
-short RF pulses. It logs pulse characteristics (amplitude, peak dB, width, SNR,
-PAR, PRI) to a CSV file and supports both manual offset scanning and automatic
-offset discovery (±10 kHz in 1 kHz steps). It also supports enabling/disabling the
-bias‑T (antenna power) unconditionally when requested by the user.
+PulseCounter SDR Logger — Normal + Zero Mode (Pi Zero 2 W optimized)
+-------------------------------------------------------------------
+Normal mode (default):
+- FIR anti-alias + decimation via SciPy (kaiserord/firwin/upfirdn)
+- Peak detection via SciPy find_peaks
 
-Enhancements:
-- FIR anti-alias + aggressive decimation (configurable) to maximize sensitivity.
-- OverloadMonitor detects ADC clipping and RF compression from IQ amplitude stats.
-- Optional tuner gain step-down on overload (--overload-stepdown).
+Zero mode (--zero-mode):
+- CIC decimation (fast)
+- EMA smoothing (fast)
+- Threshold-crossing peak detector (fast)
+- Auto-adjusts defaults unless user explicitly set them
 
-Added in this integrated version:
-1) Sample-based timestamps for pulses:
-   - pulse timestamp = TS_WALL0 + (global_decimated_sample_index / FS_DEC)
-   - fixes PRI drift caused by processing delays / scheduling jitter
-
-2) Per-frequency performance monitor:
-   - measures read/proc/total times vs the real-time duration represented by the samples
-   - prints every --perf-every blocks per frequency when --perf is enabled
-   - warns when behind real-time
+Common to both:
+- Sample-based timestamps for pulses:
+    t_peak = TS_WALL0 + (global_decimated_sample_index + peak_index) / FS_DEC
+  This stabilizes PRI (reduces drift caused by CPU/IO timing variability).
+- Per-frequency performance monitor (--perf) printing every --perf-every blocks.
+- Immediate CSV writes (no batching).
 """
 
 import numpy as np
@@ -34,73 +30,80 @@ import statistics
 import subprocess
 from collections import deque
 from rtlsdr import RtlSdr
-from scipy.signal import kaiserord, firwin, upfirdn, find_peaks
 
 # -----------------------------
 # Default configuration values
 # -----------------------------
-DEFAULT_CENTER_FREQ = 163.557e6  # Wildlife telemetry frequency
-DEFAULT_SAMPLE_RATE = 2.4e6      # High-rate oversampling
+DEFAULT_CENTER_FREQ = 163.557e6
+
+# Normal-mode defaults (original-ish)
+FULL_DEFAULT_SAMPLE_RATE = 2.4e6
+FULL_DEFAULT_BLOCK_SIZE = 262144
+FULL_DEFAULT_TARGET_FS_DEC = 30_000.0
+FULL_READ_MULT = 10
+
+# Zero-mode defaults (Pi-friendly)
+ZERO_DEFAULT_SAMPLE_RATE = 1.024e6
+ZERO_DEFAULT_BLOCK_SIZE = 131072
+ZERO_DEFAULT_TARGET_FS_DEC = 25_600.0
+ZERO_READ_MULT = 4
+
 DEFAULT_GAIN = None
-DEFAULT_BLOCK_SIZE = 262144
 DEFAULT_THRESHOLD_MULT = 5.0
 DEFAULT_MIN_WIDTH_MS = 1.0
 DEFAULT_SCAN_TIME = 30.0
 PRI_WINDOW = 10
 
-# Decimation defaults (can be overridden via CLI)
-DEFAULT_TARGET_DECIMATED_RATE = 30_000.0
+# FIR design defaults (normal mode)
 PB_FRAC = 0.50
 TRANS_FRAC = 0.15
 RIPPLE_DB = 60.0
+
+# Envelope smoothing
 ENV_SMOOTH_MS = 3.0
 
+
 # -----------------------------
-# Command-line argument parser
+# CLI
 # -----------------------------
 parser = argparse.ArgumentParser(
-    description="Pulse counter SDR logger with scanning, bias‑T, configurable decimation, and overload detection"
+    description="Pulse counter SDR logger with scanning, bias-T, decimation, overload detection, and zero-mode"
 )
 
 parser.add_argument("-f", "--freq", type=float, nargs="+", default=[DEFAULT_CENTER_FREQ],
                     help="Base frequencies in Hz.")
-
 parser.add_argument("--offsets", type=float, nargs="*", default=[0],
                     help="Manual frequency offsets in Hz.")
-
 parser.add_argument("--autodiscover", action="store_true",
                     help="Auto-discover strongest offset (+/- 10 kHz, 1 kHz steps).")
 
 parser.add_argument("--biast", action="store_true",
-                    help="Enable bias‑T (antenna power). No hardware detection performed.")
+                    help="Enable bias-T (antenna power). No hardware detection performed.")
 
-parser.add_argument("-r", "--rate", type=float, default=DEFAULT_SAMPLE_RATE,
-                    help="Input sample rate in Hz (e.g., 2.4e6)")
-
+# Use default=None so zero-mode can auto-adjust defaults only when user didn't set them
+parser.add_argument("-r", "--rate", type=float, default=None,
+                    help="Input sample rate in Hz (normal default: 2.4e6; zero-mode default: 1.024e6)")
 parser.add_argument("-g", "--gain", type=float, default=DEFAULT_GAIN,
-                    help="Gain in dB (float). Omit for automatic gain (~38.6 dB).")
-
-parser.add_argument("-b", "--block", type=int, default=DEFAULT_BLOCK_SIZE,
-                    help="Block size at the input sample rate")
+                    help="Gain in dB (float). Omit for default gain (~38.6 dB).")
+parser.add_argument("-b", "--block", type=int, default=None,
+                    help="Block size at input sample rate (normal default: 262144; zero-mode default: 131072)")
 
 parser.add_argument("-t", "--threshold", type=float, default=DEFAULT_THRESHOLD_MULT,
-                    help="Threshold multiplier on the decimated envelope (e.g., 5.0)")
-
+                    help="Threshold multiplier on decimated envelope (e.g., 5.0)")
 parser.add_argument("-m", "--minwidth", type=float, default=DEFAULT_MIN_WIDTH_MS,
                     help="Minimum pulse width in ms")
-
 parser.add_argument("-s", "--scantime", type=float, default=DEFAULT_SCAN_TIME,
                     help="Seconds to spend on each frequency")
 
-# Decimation control
-parser.add_argument("--target-fs-dec", type=float, default=DEFAULT_TARGET_DECIMATED_RATE,
-                    help="Target decimated sample rate in Hz (e.g., 20000 for ~20 kS/s). Ignored if --decim is set.")
+# Decimation controls (default=None allows mode defaults)
+parser.add_argument("--target-fs-dec", type=float, default=None,
+                    help="Target decimated sample rate (Hz). Normal default 30000; zero-mode default 25600. Ignored if --decim is set.")
 parser.add_argument("--decim", type=int, default=None,
                     help="Explicit integer decimation factor (overrides --target-fs-dec).")
 
-# Overload detection options
+# Overload options
 parser.add_argument("--overload-stepdown", action="store_true",
-                    help="Automatically step the tuner gain down one notch on overload.")
+                    help="Automatically step tuner gain down on overload.")
 parser.add_argument("--overload-debug", action="store_true",
                     help="Print overload metrics every block (verbose).")
 
@@ -112,7 +115,24 @@ parser.add_argument("--perf-every", type=int, default=10,
 parser.add_argument("--perf-warn", type=float, default=1.05,
                     help="Warn if total_time/block_duration exceeds this ratio (default: 1.05).")
 
+# Zero mode
+parser.add_argument("--zero-mode", action="store_true",
+                    help="Pi Zero 2 W optimized mode: CIC decimation + EMA smoothing + lightweight peak detection; auto-adjusts defaults.")
+
 args = parser.parse_args()
+ZERO_MODE = bool(args.zero_mode)
+
+# Conditional SciPy import: only required for normal mode
+if not ZERO_MODE:
+    from scipy.signal import kaiserord, firwin, upfirdn, find_peaks
+
+# Apply mode defaults only when user did not explicitly set them
+if args.rate is None:
+    args.rate = ZERO_DEFAULT_SAMPLE_RATE if ZERO_MODE else FULL_DEFAULT_SAMPLE_RATE
+if args.block is None:
+    args.block = ZERO_DEFAULT_BLOCK_SIZE if ZERO_MODE else FULL_DEFAULT_BLOCK_SIZE
+if args.target_fs_dec is None:
+    args.target_fs_dec = ZERO_DEFAULT_TARGET_FS_DEC if ZERO_MODE else FULL_DEFAULT_TARGET_FS_DEC
 
 # Assign parsed values
 FREQ_LIST = args.freq
@@ -123,28 +143,34 @@ BLOCK_SIZE = int(args.block)
 THRESHOLD_MULT = float(args.threshold)
 MIN_WIDTH_MS = float(args.minwidth)
 SCAN_TIME = float(args.scantime)
-AUTO_STEPDOWN = args.overload_stepdown
-OVERLOAD_DEBUG = args.overload_debug
+
 TARGET_FS_DEC_ARG = float(args.target_fs_dec)
 DECIM_ARG = args.decim
+
+AUTO_STEPDOWN = args.overload_stepdown
+OVERLOAD_DEBUG = args.overload_debug
 
 PERF = bool(args.perf)
 PERF_EVERY = max(1, int(args.perf_every))
 PERF_WARN = float(args.perf_warn)
 
+READ_MULT = ZERO_READ_MULT if ZERO_MODE else FULL_READ_MULT
+
+
 # ---------------------------------------------------
-# Bias‑T control helpers
+# Bias-T helpers
 # ---------------------------------------------------
 def bias_t_on():
-    subprocess.run(["rtl_biast", "-b", "1"])
-    print("Bias‑T ENABLED (antenna power ON)")
+    subprocess.run(["rtl_biast", "-b", "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("Bias-T ENABLED (antenna power ON)")
 
 def bias_t_off():
-    subprocess.run(["rtl_biast", "-b", "0"])
-    print("Bias‑T DISABLED (antenna power OFF)")
+    subprocess.run(["rtl_biast", "-b", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("Bias-T DISABLED (antenna power OFF)")
+
 
 # ---------------------------------------------------
-# Pulse width at half-maximum (works at any sample rate)
+# Width estimator (half-max, amplitude domain)
 # ---------------------------------------------------
 def estimate_width(env, peak_idx, sr):
     if peak_idx <= 0 or peak_idx >= len(env):
@@ -158,47 +184,45 @@ def estimate_width(env, peak_idx, sr):
         right += 1
     return (right - left) / sr
 
+
 # ---------------------------------------------------
-# Automatic offset discovery (simple max envelope scan)
+# Offset discovery
 # ---------------------------------------------------
-def discover_best_offset(base_freq, sdr, block_size, sample_rate):
+def discover_best_offset(base_freq, sdr, block_size):
     OFFSET_RANGE = 10000
     OFFSET_STEP = 1000
 
     best_offset = 0
-    best_score = 0
+    best_score = 0.0
 
     print(f"  Auto-discovering offset for {base_freq/1e6:.6f} MHz...")
 
     for off in range(-OFFSET_RANGE, OFFSET_RANGE + 1, OFFSET_STEP):
-        test_freq = base_freq + off
-        sdr.center_freq = test_freq
-
-        samples = sdr.read_samples(block_size * 2)
+        sdr.center_freq = base_freq + off
+        samples = sdr.read_samples(block_size * 2).astype(np.complex64, copy=False)
         env = np.abs(samples)
         score = float(np.max(env)) if env.size else 0.0
-
         if score > best_score:
             best_score = score
             best_offset = off
 
-    print(f"  Best offset: {best_offset/1000:.1f} kHz → using {(base_freq + best_offset)/1e6:.6f} MHz")
+    print(f"  Best offset: {best_offset/1000:.1f} kHz -> using {(base_freq + best_offset)/1e6:.6f} MHz")
     return base_freq + best_offset
 
+
 # ---------------------------------------------------
-# FIR decimator (polyphase) with overlap-save
+# Decimators
 # ---------------------------------------------------
 class FIRDecimator:
-    def __init__(self, fs_in, target_fs=DEFAULT_TARGET_DECIMATED_RATE, pb_frac=PB_FRAC, trans_frac=TRANS_FRAC,
-                 ripple_db=RIPPLE_DB, explicit_decim=None):
+    """Normal mode FIR decimator using SciPy (polyphase via upfirdn)."""
+    def __init__(self, fs_in, target_fs, pb_frac=PB_FRAC, trans_frac=TRANS_FRAC, ripple_db=RIPPLE_DB, explicit_decim=None):
         self.fs_in = float(fs_in)
 
         if explicit_decim is not None and explicit_decim >= 1:
             self.decim = int(explicit_decim)
-            self.fs_dec = self.fs_in / self.decim
         else:
             self.decim = max(1, int(round(self.fs_in / float(target_fs))))
-            self.fs_dec = self.fs_in / self.decim
+        self.fs_dec = self.fs_in / self.decim
 
         nyq_in = self.fs_in / 2.0
         nyq_dec = self.fs_dec / 2.0
@@ -224,15 +248,119 @@ class FIRDecimator:
         self._in_tail = x_in[-(len(self.taps) - 1):].copy()
         return y
 
+
+class CICDecimator:
+    """Zero-mode fast CIC decimator (order=2) suitable for envelope/pulse detection."""
+    def __init__(self, fs_in, target_fs, explicit_decim=None, order=2):
+        self.fs_in = float(fs_in)
+        if explicit_decim is not None and explicit_decim >= 1:
+            self.decim = int(explicit_decim)
+        else:
+            self.decim = max(1, int(round(self.fs_in / float(target_fs))))
+        self.fs_dec = self.fs_in / self.decim
+
+        self.order = int(max(1, order))
+        self.int_state = np.zeros(self.order, dtype=np.complex64)
+        self.comb_state = np.zeros(self.order, dtype=np.complex64)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        x = x.astype(np.complex64, copy=False)
+
+        y = x
+        for k in range(self.order):
+            y = np.cumsum(y, dtype=np.complex64) + self.int_state[k]
+            self.int_state[k] = y[-1]
+
+        y = y[::self.decim]
+
+        for k in range(self.order):
+            prev = self.comb_state[k]
+            out = np.empty_like(y)
+            out[0] = y[0] - prev
+            out[1:] = y[1:] - y[:-1]
+            self.comb_state[k] = y[-1]
+            y = out
+
+        return y
+
+
 # ---------------------------------------------------
-# Overload detection (IQ amplitude statistics)
+# Zero-mode smoothing & peak detection
+# ---------------------------------------------------
+class EMAFilter:
+    """Cheap EMA smoothing filter on float arrays (used on power, then sqrt back to amplitude)."""
+    def __init__(self, fs, smooth_ms=3.0):
+        tau = max(1e-6, smooth_ms / 1000.0)
+        self.alpha = 1.0 - np.exp(-1.0 / max(1.0, fs * tau))
+        self.state = 0.0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        y = np.empty_like(x, dtype=np.float32)
+        s = float(self.state)
+        a = float(self.alpha)
+        for i in range(x.size):
+            s = s + a * (float(x[i]) - s)
+            y[i] = s
+        self.state = s
+        return y
+
+
+class PeakTracker:
+    """
+    Threshold-crossing detector:
+    returns one peak index per contiguous above-threshold region,
+    with refractory samples to merge close pulses (merge_guard_ms).
+    """
+    def __init__(self, fs_dec, merge_guard_ms=50.0):
+        self.fs_dec = float(fs_dec)
+        self.merge_guard = int((merge_guard_ms / 1000.0) * self.fs_dec)
+        self.in_pulse = False
+        self.peak_idx = 0
+        self.peak_val = 0.0
+        self.refractory = 0
+
+    def find_peaks(self, env: np.ndarray, thr: float):
+        peaks = []
+        above = env > thr
+        n = env.size
+        i = 0
+
+        while i < n:
+            if self.refractory > 0:
+                skip = min(self.refractory, n - i)
+                self.refractory -= skip
+                i += skip
+                continue
+
+            if not self.in_pulse:
+                if above[i]:
+                    self.in_pulse = True
+                    self.peak_idx = i
+                    self.peak_val = float(env[i])
+                i += 1
+            else:
+                v = float(env[i])
+                if v > self.peak_val:
+                    self.peak_val = v
+                    self.peak_idx = i
+
+                if not above[i]:
+                    peaks.append(self.peak_idx)
+                    self.in_pulse = False
+                    self.refractory = self.merge_guard
+                i += 1
+
+        return peaks
+
+
+# ---------------------------------------------------
+# Overload monitor (kept the same for consistency)
 # ---------------------------------------------------
 class OverloadMonitor:
     """
     Detects ADC clipping and RF gain compression from IQ amplitude statistics.
     Designed for pyrtlsdr complex64 streams scaled ~[-1, 1].
     """
-
     def __init__(self,
                  clip_thr=0.98,
                  crest_min=2.2,
@@ -253,7 +381,6 @@ class OverloadMonitor:
         self.kurt_relax = float(kurt_relax)
         self.clip_ratio_min = float(clip_ratio_min)
         self.clip_ratio_relax = float(clip_ratio_relax)
-
         self.rms_hist = deque(maxlen=int(rms_hist_len))
         self.overloaded = False
 
@@ -306,12 +433,14 @@ class OverloadMonitor:
             "overloaded": self.overloaded
         }
 
+
 def maybe_stepdown_gain(sdr: RtlSdr, verbose=True):
     """Step the tuner gain down one notch (if possible)."""
     try:
         current = float(sdr.gain)
     except Exception:
         return None
+
     new_gain = None
     try:
         gains = sorted(set(sdr.get_gains()))
@@ -328,11 +457,12 @@ def maybe_stepdown_gain(sdr: RtlSdr, verbose=True):
         try:
             sdr.gain = new_gain
             if verbose:
-                print(f"[OVERLOAD] Reducing tuner gain: {current:.1f} dB → {new_gain:.1f} dB")
+                print(f"[OVERLOAD] Reducing tuner gain: {current:.1f} dB -> {new_gain:.1f} dB")
             return new_gain
         except Exception:
             pass
     return None
+
 
 # -----------------------------
 # Initialize SDR
@@ -340,60 +470,29 @@ def maybe_stepdown_gain(sdr: RtlSdr, verbose=True):
 sdr = RtlSdr()
 sdr.sample_rate = SAMPLE_RATE
 
-# Bias‑T control
+# Bias-T
 if args.biast:
-    print("Bias‑T requested → enabling")
+    print("Bias-T requested -> enabling")
     bias_t_on()
     biast_status = "ON"
 else:
-    print("Bias‑T not requested → disabling")
+    print("Bias-T not requested -> disabling")
     bias_t_off()
     biast_status = "OFF"
 
-# Gain handling
+# Gain
 if GAIN is None:
-    print("Auto gain requested → using default gain of 38.6 dB")
+    print("Auto gain requested -> using default gain of 38.6 dB")
     sdr.gain = 38.6
 else:
     sdr.gain = float(GAIN)
 
-# Build FIR decimator with CLI control
-decimator = FIRDecimator(
-    fs_in=SAMPLE_RATE,
-    target_fs=TARGET_FS_DEC_ARG,
-    pb_frac=PB_FRAC,
-    trans_frac=TRANS_FRAC,
-    ripple_db=RIPPLE_DB,
-    explicit_decim=DECIM_ARG
-)
-FS_DEC = decimator.fs_dec
-print(f"[Decimator] Fs_in={SAMPLE_RATE/1e6:.3f} MS/s, decim={decimator.decim} → Fs_dec={FS_DEC/1e3:.1f} kS/s")
-
-if FS_DEC < 8000:
-    print(f"[WARN] Very low decimated rate ({FS_DEC:.0f} Hz). Ensure your tag is stable and threshold is tuned.")
-
-# Envelope smoothing window (in decimated samples)
-ENV_SMOOTH_WIN = max(1, int((ENV_SMOOTH_MS / 1000.0) * FS_DEC))
-ENV_SMOOTH_KERNEL = np.ones(ENV_SMOOTH_WIN, dtype=float) / float(ENV_SMOOTH_WIN)
-
-def smooth_envelope(env_dec: np.ndarray) -> np.ndarray:
-    if ENV_SMOOTH_WIN <= 1:
-        return env_dec
-    return np.convolve(env_dec, ENV_SMOOTH_KERNEL, mode='same')
-
-# Overload monitor
-ol = OverloadMonitor()
-
-# ---------------------------------------------------
-# Build final frequency list
-# ---------------------------------------------------
+# Build frequency list
 EXPANDED_FREQ_LIST = []
-
 if args.autodiscover:
     print("=== Automatic Offset Discovery Enabled ===")
     for base in FREQ_LIST:
-        real_freq = discover_best_offset(base, sdr, BLOCK_SIZE, SAMPLE_RATE)
-        EXPANDED_FREQ_LIST.append(real_freq)
+        EXPANDED_FREQ_LIST.append(discover_best_offset(base, sdr, BLOCK_SIZE))
 else:
     for base in FREQ_LIST:
         for off in OFFSETS:
@@ -401,43 +500,77 @@ else:
 
 print("Expanded scan frequencies (MHz):", [round(f/1e6, 6) for f in EXPANDED_FREQ_LIST])
 
+# Build decimator
+if ZERO_MODE:
+    decimator = CICDecimator(fs_in=SAMPLE_RATE, target_fs=TARGET_FS_DEC_ARG, explicit_decim=DECIM_ARG, order=2)
+else:
+    decimator = FIRDecimator(fs_in=SAMPLE_RATE, target_fs=TARGET_FS_DEC_ARG,
+                             pb_frac=PB_FRAC, trans_frac=TRANS_FRAC,
+                             ripple_db=RIPPLE_DB, explicit_decim=DECIM_ARG)
+
+FS_DEC = float(decimator.fs_dec)
+print(f"[{('Zero-Mode' if ZERO_MODE else 'Normal')}] Fs_in={SAMPLE_RATE/1e6:.3f} MS/s, decim={decimator.decim} -> Fs_dec={FS_DEC/1e3:.1f} kS/s")
+print(f"[Read] BLOCK_SIZE={BLOCK_SIZE}, READ_MULT={READ_MULT}, chunk={BLOCK_SIZE*READ_MULT} samples")
+
+if FS_DEC < 8000:
+    print(f"[WARN] Very low decimated rate ({FS_DEC:.0f} Hz). Ensure your tag is stable and threshold is tuned.")
+
+# Smoothing / peak detector
+if ZERO_MODE:
+    ema = EMAFilter(fs=FS_DEC, smooth_ms=ENV_SMOOTH_MS)
+    peak_tracker = PeakTracker(fs_dec=FS_DEC, merge_guard_ms=50.0)
+else:
+    ENV_SMOOTH_WIN = max(1, int((ENV_SMOOTH_MS / 1000.0) * FS_DEC))
+    ENV_SMOOTH_KERNEL = np.ones(ENV_SMOOTH_WIN, dtype=float) / float(ENV_SMOOTH_WIN)
+
+    def smooth_envelope(env_dec: np.ndarray) -> np.ndarray:
+        if ENV_SMOOTH_WIN <= 1:
+            return env_dec
+        return np.convolve(env_dec, ENV_SMOOTH_KERNEL, mode='same')
+
+# Overload
+ol = OverloadMonitor()
+
 # ---------------------------------------------------
-# Prepare CSV output files
+# CSV setup
 # ---------------------------------------------------
 current_date = datetime.date.today()
 data_filename = f"pulsecounter-data-{current_date.isoformat()}.csv"
 meta_filename = f"pulsecounter-meta-{current_date.isoformat()}.csv"
 start_time = datetime.datetime.now()
 
-# Sample-based timestamp patch: fixed wall-clock origin + global decimated sample counter
+# Sample-based timestamp patch
 TS_WALL0 = time.time()
 DEC_SAMP_COUNTER = 0
 
-# Performance monitor state (per frequency)
+# Perf state per frequency
 perf_state = {fr: {"count": 0, "ema_ratio": None} for fr in EXPANDED_FREQ_LIST}
 
-# Metadata file
-with open(meta_filename, mode='w', newline='') as mf:
-    meta_writer = csv.writer(mf)
-    meta_writer.writerow(["Logging Metadata"])
-    meta_writer.writerow(["Start Time", start_time.isoformat(timespec='seconds')])
-    meta_writer.writerow(["Timestamp Mode", "sample-based (TS_WALL0 + sample_index/FS_DEC)"])
-    meta_writer.writerow(["Perf Monitor", "ON" if PERF else "OFF"])
-    meta_writer.writerow(["Perf Every (blocks)", PERF_EVERY])
-    meta_writer.writerow(["Perf Warn Ratio", PERF_WARN])
-    meta_writer.writerow(["Sample Rate (input) Hz", SAMPLE_RATE])
-    meta_writer.writerow(["Decimation Factor", decimator.decim])
-    meta_writer.writerow(["Sample Rate (decimated) Hz", FS_DEC])
-    meta_writer.writerow(["Frequencies", ";".join(str(f) for f in EXPANDED_FREQ_LIST)])
-    meta_writer.writerow(["Gain", "AUTO" if GAIN is None else GAIN])
-    meta_writer.writerow(["Bias‑T", biast_status])
-    meta_writer.writerow(["Input Block Size (samples)", BLOCK_SIZE])
-    meta_writer.writerow(["Threshold Multiplier", THRESHOLD_MULT])
-    meta_writer.writerow(["Minimum Width (ms)", MIN_WIDTH_MS])
-    meta_writer.writerow(["Scan Time (s)", SCAN_TIME])
-    meta_writer.writerow(["Data File", data_filename])
+# PRI state per frequency
+freq_state = {fr: {"last_peak_time": None, "pri_list": []} for fr in EXPANDED_FREQ_LIST}
 
-# Data CSV
+with open(meta_filename, mode='w', newline='') as mf:
+    mw = csv.writer(mf)
+    mw.writerow(["Logging Metadata"])
+    mw.writerow(["Start Time", start_time.isoformat(timespec='seconds')])
+    mw.writerow(["Zero Mode", "ON" if ZERO_MODE else "OFF"])
+    mw.writerow(["Timestamp Mode", "sample-based (TS_WALL0 + sample_index/FS_DEC)"])
+    mw.writerow(["Perf Monitor", "ON" if PERF else "OFF"])
+    mw.writerow(["Perf Every (blocks)", PERF_EVERY])
+    mw.writerow(["Perf Warn Ratio", PERF_WARN])
+    mw.writerow(["Sample Rate (input) Hz", SAMPLE_RATE])
+    mw.writerow(["Decimation Factor", decimator.decim])
+    mw.writerow(["Sample Rate (decimated) Hz", FS_DEC])
+    mw.writerow(["Read Multiplier", READ_MULT])
+    mw.writerow(["Frequencies", ";".join(str(f) for f in EXPANDED_FREQ_LIST)])
+    mw.writerow(["Gain", "AUTO" if GAIN is None else GAIN])
+    mw.writerow(["Bias-T", biast_status])
+    mw.writerow(["Input Block Size (samples)", BLOCK_SIZE])
+    mw.writerow(["Threshold Multiplier", THRESHOLD_MULT])
+    mw.writerow(["Minimum Width (ms)", MIN_WIDTH_MS])
+    mw.writerow(["Scan Time (s)", SCAN_TIME])
+    mw.writerow(["Data File", data_filename])
+
 f = open(data_filename, mode='w', newline='')
 writer = csv.writer(f)
 writer.writerow([
@@ -448,8 +581,6 @@ writer.writerow([
     "Overloaded"
 ])
 
-# PRI state per frequency
-freq_state = {fr: {"last_peak_time": None, "pri_list": []} for fr in EXPANDED_FREQ_LIST}
 
 # ---------------------------------------------------
 # Main scanning loop
@@ -461,73 +592,81 @@ try:
             print(f"--- Scanning {freq/1e6:.6f} MHz ---")
             scan_start = time.time()
 
-            # Reset perf counters for this scan window (per frequency)
+            # Reset perf counters per scan window for this frequency
             perf_state[freq]["count"] = 0
             perf_state[freq]["ema_ratio"] = None
 
             while (time.time() - scan_start) < SCAN_TIME:
-                # ---- Perf timing start ----
+                # ---- perf timing start ----
                 t_loop0 = time.perf_counter()
                 t_read0 = t_loop0
 
-                # Read chunk at input Fs for better decimation efficiency
-                samples = sdr.read_samples(BLOCK_SIZE * 10).astype(np.complex64, copy=False)
+                samples = sdr.read_samples(BLOCK_SIZE * READ_MULT).astype(np.complex64, copy=False)
 
                 t_read1 = time.perf_counter()
 
-                # ------ Overload detection on raw IQ ------
+                # overload detection
                 ol_metrics = ol.update(samples)
                 overloaded = ol_metrics["overloaded"]
-
                 if OVERLOAD_DEBUG or overloaded:
-                    msg = (f"[OVERLOAD={'YES' if overloaded else 'no '}] "
-                           f"crest={ol_metrics['crest']:.2f} "
-                           f"clip={ol_metrics['clip_ratio']:.2e} "
-                           f"p99={ol_metrics['p99']:.3f} p999={ol_metrics['p999']:.3f} "
-                           f"kurt={ol_metrics['kurt']:.2f}")
-                    print(msg)
+                    print(f"[OVERLOAD={'YES' if overloaded else 'no '}] "
+                          f"crest={ol_metrics['crest']:.2f} "
+                          f"clip={ol_metrics['clip_ratio']:.2e} "
+                          f"p99={ol_metrics['p99']:.3f} p999={ol_metrics['p999']:.3f} "
+                          f"kurt={ol_metrics['kurt']:.2f}")
 
                 if overloaded and AUTO_STEPDOWN:
                     maybe_stepdown_gain(sdr, verbose=True)
 
-                # DC removal (mitigate tuner DC offset)
+                # DC removal
                 samples = samples - np.mean(samples)
 
-                # ======== FIR anti-alias + decimation (complex IQ) ========
-                dec = decimator.process(samples)  # complex64 at FS_DEC
+                # decimate
+                dec = decimator.process(samples)
 
-                # Envelope at low rate; smooth ~3 ms to reduce spikes
-                env = np.abs(dec)
-                if ENV_SMOOTH_WIN > 1:
-                    env = smooth_envelope(env)
+                # envelope + smoothing (keep amplitude domain for consistency)
+                if ZERO_MODE:
+                    # Smooth in power domain cheaply, then sqrt back to amplitude
+                    env2 = (dec.real * dec.real) + (dec.imag * dec.imag)
+                    env2 = env2.astype(np.float32, copy=False)
+                    env2 = ema.process(env2)
+                    env = np.sqrt(env2, dtype=np.float32)
+                else:
+                    env = np.abs(dec)
+                    if ENV_SMOOTH_WIN > 1:
+                        env = smooth_envelope(env)
 
-                # Sample-based timestamp patch: establish sample index range for this block
+                # sample-based timestamp bookkeeping for this block
                 block_dec_start = DEC_SAMP_COUNTER
                 DEC_SAMP_COUNTER += int(env.size)
 
-                # Robust noise estimate & threshold on decimated envelope
+                # noise floor + threshold
                 noise_floor = float(np.median(env)) if env.size else 0.0
                 threshold = noise_floor * THRESHOLD_MULT
 
-                # Peak picking at decimated rate
-                raw_peaks, _ = find_peaks(env, height=threshold)
+                # peaks
+                if ZERO_MODE:
+                    merged_peaks = peak_tracker.find_peaks(env, threshold)
+                else:
+                    raw_peaks, _ = find_peaks(env, height=threshold)
 
-                # Merge close peaks (within 50 ms)
-                merged_peaks = []
-                if len(raw_peaks) > 0:
-                    current = raw_peaks[0]
-                    merge_samps = int(0.05 * FS_DEC)  # 50 ms guard
-                    for p in raw_peaks[1:]:
-                        if (p - current) < merge_samps:
-                            if env[p] > env[current]:
+                    # merge close peaks (50 ms guard)
+                    merged_peaks = []
+                    if len(raw_peaks) > 0:
+                        current = raw_peaks[0]
+                        merge_samps = int(0.05 * FS_DEC)
+                        for p in raw_peaks[1:]:
+                            if (p - current) < merge_samps:
+                                if env[p] > env[current]:
+                                    current = p
+                            else:
+                                merged_peaks.append(current)
                                 current = p
-                        else:
-                            merged_peaks.append(current)
-                            current = p
-                    merged_peaks.append(current)
+                        merged_peaks.append(current)
 
+                # process peaks
                 for p in merged_peaks:
-                    # Sample-based timestamp for this peak
+                    # sample-based timestamp for this peak
                     t_peak = TS_WALL0 + (block_dec_start + int(p)) / FS_DEC
                     now = datetime.datetime.fromtimestamp(t_peak)
                     timestamp = now.time().isoformat(timespec='microseconds')
@@ -547,8 +686,7 @@ try:
                     if state["last_peak_time"] is None:
                         delta_ms = 0.0
                     else:
-                        delta = now - state["last_peak_time"]
-                        delta_ms = delta.total_seconds() * 1e3
+                        delta_ms = (now - state["last_peak_time"]).total_seconds() * 1e3
                         state["pri_list"].append(delta_ms)
                         if len(state["pri_list"]) > PRI_WINDOW:
                             state["pri_list"].pop(0)
@@ -575,16 +713,14 @@ try:
                           f"Δt={delta_ms:.2f} ms, Avg PRI={avg_pri:.2f}, Mode PRI={mode_pri:.2f}, "
                           f"Overloaded={'YES' if overloaded else 'no'}")
 
-                # ---- Perf timing end ----
+                # ---- perf timing end ----
                 t_loop1 = time.perf_counter()
 
-                # Per-frequency perf monitor line (prints every PERF_EVERY blocks)
                 if PERF:
                     block_dur_s = samples.size / float(SAMPLE_RATE) if SAMPLE_RATE > 0 else 0.0
                     read_s = t_read1 - t_read0
                     total_s = t_loop1 - t_loop0
                     proc_s = total_s - read_s
-
                     ratio = (total_s / block_dur_s) if block_dur_s > 0 else 0.0
 
                     ps = perf_state[freq]
@@ -602,8 +738,9 @@ try:
 except KeyboardInterrupt:
     stop_time = datetime.datetime.now()
     with open(meta_filename, mode='a', newline='') as mf:
-        meta_writer = csv.writer(mf)
-        meta_writer.writerow(["Stop Time", stop_time.isoformat(timespec='seconds')])
+        mw = csv.writer(mf)
+        mw.writerow(["Stop Time", stop_time.isoformat(timespec='seconds')])
+
     print("\nStopping continuous logging...")
     f.close()
     sdr.close()
